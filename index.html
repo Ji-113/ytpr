@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
+<title>Relay — YouTube 中継プレイヤー</title>
+<style>
+  :root {
+    --bg: #0e0f11;
+    --panel: #17191c;
+    --line: #2a2d32;
+    --text: #e9e7e2;
+    --muted: #8c8f96;
+    --accent: #f2b33d;
+    --err: #ff6b5e;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font-family: "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
+    min-height: 100vh;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 28px 20px 60px; }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 22px; }
+  .logo {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-weight: 700; letter-spacing: .08em; font-size: 15px;
+  }
+  .logo span { color: var(--accent); }
+  .tag { color: var(--muted); font-size: 12px; }
+
+  form { display: flex; gap: 8px; }
+  input[type=text] {
+    flex: 1; min-width: 0;
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px;
+    padding: 13px 14px; font-size: 15px; outline: none;
+  }
+  input[type=text]:focus { border-color: var(--accent); }
+  button {
+    background: var(--accent); color: #1a1406; border: 0; border-radius: 10px;
+    padding: 0 20px; font-weight: 700; font-size: 14px; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: wait; }
+
+  .status { margin: 14px 2px 0; font-size: 13px; color: var(--muted); min-height: 1.2em; }
+  .status.err { color: var(--err); }
+
+  .stage { margin-top: 18px; display: none; }
+  .stage.on { display: block; }
+  .player {
+    position: relative; background: #000; border-radius: 12px; overflow: hidden;
+    aspect-ratio: 16 / 9; border: 1px solid var(--line);
+  }
+  video { width: 100%; height: 100%; display: block; background: #000; }
+
+  .meta { display: flex; gap: 16px; align-items: flex-start; margin-top: 14px; flex-wrap: wrap; }
+  .meta-main { flex: 1; min-width: 240px; }
+  h1 { font-size: 19px; line-height: 1.45; margin: 0 0 6px; font-weight: 700; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .controls { display: flex; gap: 8px; align-items: center; }
+  select {
+    background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; font-size: 13px;
+  }
+  .pill {
+    font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 999px; padding: 3px 9px;
+  }
+  details { margin-top: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  summary { cursor: pointer; padding: 11px 14px; font-size: 13px; color: var(--muted); }
+  .desc { white-space: pre-wrap; padding: 0 14px 14px; font-size: 13px; line-height: 1.7; word-break: break-word; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">RE<span>/</span>LAY</div>
+    <div class="tag">すべての通信をこのサーバー経由で再生</div>
+  </header>
+
+  <form id="form">
+    <input id="url" type="text" placeholder="YouTube の URL を貼り付け（youtu.be / watch?v= / shorts も可）" autocomplete="off" />
+    <button id="go" type="submit">再生</button>
+  </form>
+  <div id="status" class="status"></div>
+
+  <section id="stage" class="stage">
+    <div class="player">
+      <video id="video" controls playsinline preload="metadata"></video>
+      <audio id="audio" preload="auto"></audio>
+    </div>
+    <div class="meta">
+      <div class="meta-main">
+        <h1 id="title"></h1>
+        <div class="sub" id="sub"></div>
+      </div>
+      <div class="controls">
+        <span class="pill" id="mode"></span>
+        <select id="quality" title="画質"></select>
+      </div>
+    </div>
+    <details id="descBox">
+      <summary>概要欄</summary>
+      <div class="desc" id="desc"></div>
+    </details>
+  </section>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const video = $('video');
+const audio = $('audio');
+let current = null;      // /api/info の結果
+let dual = false;        // 映像と音声を別々に流しているか
+let syncTimer = null;
+
+function setStatus(msg, isErr = false) {
+  $('status').textContent = msg;
+  $('status').classList.toggle('err', isErr);
+}
+
+function fmtDuration(s) {
+  if (!s) return '';
+  s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(sec).padStart(2, '0');
+}
+function fmtDate(d) {
+  return d ? `${d.slice(0, 4)}/${d.slice(4, 6)}/${d.slice(6, 8)}` : '';
+}
+
+// ブラウザが再生できる形式だけに絞る
+const playable = (mime, codec) => {
+  const c = { 'H.264': 'avc1.4d401f', VP9: 'vp9', AV1: 'av01.0.05M.08', AAC: 'mp4a.40.2', Opus: 'opus' }[codec];
+  const t = c ? `${mime}; codecs="${c}"` : mime;
+  return !!document.createElement(mime.startsWith('audio') ? 'audio' : 'video').canPlayType(t);
+};
+
+function buildQualityMenu(info) {
+  const sel = $('quality');
+  sel.innerHTML = '';
+  const audioPick = info.audio.find((a) => playable(a.mime, a.codec));
+
+  // 高さごとに再生可能な最初（=最良）の映像のみ
+  const seen = new Set();
+  const videos = info.video.filter((v) => {
+    const key = v.height + '/' + (v.fps > 30 ? 60 : 30);
+    if (seen.has(key) || !playable(v.mime, v.codec)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  if (audioPick) {
+    for (const v of videos) {
+      const o = document.createElement('option');
+      o.value = `d:${v.id}:${audioPick.id}`;
+      o.textContent = v.label;
+      o.dataset.height = v.height;
+      sel.appendChild(o);
+    }
+  }
+  for (const p of info.progressive) {
+    const o = document.createElement('option');
+    o.value = `p:${p.id}`;
+    o.textContent = p.label;
+    o.dataset.height = p.height;
+    sel.appendChild(o);
+  }
+  if (!sel.options.length) return false;
+
+  // 既定: 1080p 以下で一番高いもの（なければ先頭）
+  const saved = localStorageGet('relay.maxHeight');
+  const max = saved ? Number(saved) : 1080;
+  const def = [...sel.options].find((o) => Number(o.dataset.height) <= max) || sel.options[0];
+  sel.value = def.value;
+  return true;
+}
+
+function localStorageGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function localStorageSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
+
+// ---------- 映像と音声の同期 ----------
+function syncAudio(force = false) {
+  if (!dual) return;
+  const diff = Math.abs(audio.currentTime - video.currentTime);
+  if (force || diff > 0.25) audio.currentTime = video.currentTime;
+}
+
+video.addEventListener('play', () => { if (dual) { syncAudio(true); audio.play().catch(() => {}); } });
+video.addEventListener('playing', () => { if (dual) { syncAudio(); audio.play().catch(() => {}); } });
+video.addEventListener('pause', () => { if (dual) audio.pause(); });
+video.addEventListener('waiting', () => { if (dual) audio.pause(); });
+video.addEventListener('seeking', () => { if (dual) syncAudio(true); });
+video.addEventListener('ratechange', () => { audio.playbackRate = video.playbackRate; });
+video.addEventListener('volumechange', () => { audio.volume = video.volume; audio.muted = video.muted; });
+video.addEventListener('ended', () => audio.pause());
+
+// 音声側がバッファ待ちになったら映像も止めて待つ
+let pausedForAudio = false;
+audio.addEventListener('waiting', () => {
+  if (dual && !video.paused) { pausedForAudio = true; video.pause(); }
+});
+audio.addEventListener('canplay', () => {
+  if (dual && pausedForAudio) { pausedForAudio = false; video.play().catch(() => {}); }
+});
+
+function startSyncLoop() {
+  clearInterval(syncTimer);
+  syncTimer = setInterval(() => { if (dual && !video.paused) syncAudio(); }, 500);
+}
+
+// ---------- 再生 ----------
+function applyQuality(keepTime = true) {
+  const val = $('quality').value;
+  if (!val || !current) return;
+  const t = keepTime ? video.currentTime : 0;
+  const wasPlaying = keepTime && !video.paused;
+  const [kind, vid, aid] = val.split(':');
+
+  video.pause(); audio.pause();
+  // 映像のみのストリームには音声トラックがないので、video の音量/ミュート UI をそのまま audio に反映する
+  if (kind === 'd') {
+    dual = true;
+    video.src = `/stream/${current.id}/${vid}`;
+    audio.src = `/stream/${current.id}/${aid}`;
+    audio.volume = video.volume; audio.muted = video.muted; audio.playbackRate = video.playbackRate;
+    $('mode').textContent = '映像+音声 分離';
+  } else {
+    dual = false;
+    audio.removeAttribute('src'); audio.load();
+    video.src = `/stream/${current.id}/${vid}`;
+    $('mode').textContent = '単一ストリーム';
+  }
+
+  video.addEventListener('loadedmetadata', () => {
+    if (t) video.currentTime = t;
+    if (dual) audio.currentTime = video.currentTime;
+    if (wasPlaying || !keepTime) video.play().catch(() => {});
+  }, { once: true });
+  startSyncLoop();
+}
+
+$('quality').addEventListener('change', () => {
+  const o = $('quality').selectedOptions[0];
+  if (o) localStorageSet('relay.maxHeight', o.dataset.height);
+  applyQuality(true);
+});
+
+async function load(input, { pushState = true } = {}) {
+  input = (input || '').trim();
+  if (!input) return;
+  $('go').disabled = true;
+  setStatus('動画情報を取得しています…（初回は数秒かかります）');
+  try {
+    const r = await fetch('/api/info?url=' + encodeURIComponent(input));
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || '取得に失敗しました');
+    current = data;
+
+    if (!buildQualityMenu(data)) throw new Error('このブラウザで再生できる形式が見つかりませんでした');
+
+    $('title').textContent = data.title;
+    $('sub').textContent = [data.uploader, fmtDuration(data.duration), fmtDate(data.uploadDate),
+      data.viewCount != null ? data.viewCount.toLocaleString() + ' 回視聴' : ''].filter(Boolean).join('  ·  ');
+    $('desc').textContent = data.description || '（なし）';
+    $('descBox').style.display = data.description ? '' : 'none';
+    video.poster = data.thumbnail;
+    document.title = data.title + ' — Relay';
+    $('stage').classList.add('on');
+    setStatus('');
+
+    if (pushState) history.pushState({ id: data.id }, '', '/watch?v=' + data.id);
+    applyQuality(false);
+  } catch (e) {
+    setStatus(e.message, true);
+  } finally {
+    $('go').disabled = false;
+  }
+}
+
+if (location.protocol === 'file:') {
+  setStatus('このファイルを直接開いても動きません。ターミナルで npm start を実行し、http://localhost:3000 を開いてください。', true);
+  $('go').disabled = true;
+}
+
+$('form').addEventListener('submit', (e) => { e.preventDefault(); load($('url').value); });
+
+// /watch?v=… や /<ID> で直接開いたとき
+function idFromLocation() {
+  const q = new URLSearchParams(location.search).get('v');
+  if (q) return q;
+  const m = location.pathname.match(/^\/(?:shorts\/)?([\w-]{11})$/);
+  return m ? m[1] : null;
+}
+window.addEventListener('popstate', () => { const id = idFromLocation(); if (id) load(id, { pushState: false }); });
+const initial = idFromLocation();
+if (initial) { $('url').value = 'https://youtu.be/' + initial; load(initial, { pushState: false }); }
+</script>
+</body>
+</html>
